@@ -69,7 +69,15 @@ async function createServer() {
   wss.on("connection", (ws) => {
     let lastSentChunkIndex = -1;
 
-    // Phase 1.4: send first 30s chunk on connect
+    // Phase 2: send total duration (for progress/timestamps), then first chunk
+    const lastChunk = chunkIndex[chunkIndex.length - 1];
+    if (lastChunk) {
+      try {
+        ws.send(JSON.stringify({ duration: lastChunk.end_s }), { binary: false });
+      } catch (err) {
+        console.error("Failed to send duration:", err.message);
+      }
+    }
     const first = chunkIndex[0];
     if (first) {
       try {

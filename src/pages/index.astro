@@ -1,5 +1,5 @@
 ---
-// Phase 2 will add playback UI; Phase 1 is backend only.
+// Phase 2: WS connect + buffer, play/pause, progress bar, timestamps
 ---
 <!DOCTYPE html>
 <html lang="en">
@@ -7,9 +7,210 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Audio Streaming Test</title>
+    <style>
+      :root {
+        --played: #fff;
+        --buffered: #888;
+        --rest: #333;
+        --dot: #fff;
+      }
+      body {
+        font-family: system-ui, sans-serif;
+        background: #1a1a1a;
+        color: #eee;
+        padding: 2rem;
+        max-width: 600px;
+        margin: 0 auto;
+      }
+      h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        margin-bottom: 0.5rem;
+      }
+      button {
+        background: #444;
+        color: #fff;
+        border: none;
+        padding: 0.5rem 1rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 1rem;
+      }
+      button:hover { background: #555; }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .progress-wrap {
+        position: relative;
+        height: 24px;
+        background: var(--rest);
+        border-radius: 4px;
+        cursor: pointer;
+        overflow: visible;
+      }
+      .progress-bar {
+        position: absolute;
+        inset: 0;
+        border-radius: 4px;
+      }
+      .progress-played {
+        background: var(--played);
+        width: 0%;
+        z-index: 1;
+      }
+      .progress-buffered {
+        background: var(--buffered);
+        width: 0%;
+        z-index: 0;
+      }
+      .progress-dot {
+        position: absolute;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--dot);
+        z-index: 2;
+        pointer-events: none;
+      }
+      .time {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 0.25rem;
+        font-size: 0.875rem;
+        color: #999;
+      }
+      .status { font-size: 0.875rem; color: #888; margin-bottom: 1rem; }
+    </style>
   </head>
   <body>
     <h1>Audio Streaming Test</h1>
-    <p>Phase 1: WebSocket server is running. Connect to <code>/ws</code> to receive the first 30s chunk, then send <code>{`{"t": 45}`}</code> or <code>{`{"next": true}`}</code> for more chunks.</p>
+    <p class="status" id="status">Connecting…</p>
+    <div class="controls">
+      <button type="button" id="playBtn" disabled>Play</button>
+      <button type="button" id="pauseBtn" disabled>Pause</button>
+    </div>
+    <div class="progress-wrap" id="progressWrap">
+      <div class="progress-bar progress-buffered" id="progressBuffered"></div>
+      <div class="progress-bar progress-played" id="progressPlayed"></div>
+      <div class="progress-dot" id="progressDot"></div>
+    </div>
+    <div class="time">
+      <span id="currentTime">0:00</span>
+      <span id="totalTime">0:00</span>
+    </div>
+    <audio id="audio" preload="none"></audio>
+
+    <script>
+      (function () {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        const audio = document.getElementById("audio");
+        const playBtn = document.getElementById("playBtn");
+        const pauseBtn = document.getElementById("pauseBtn");
+        const progressWrap = document.getElementById("progressWrap");
+        const progressPlayed = document.getElementById("progressPlayed");
+        const progressBuffered = document.getElementById("progressBuffered");
+        const progressDot = document.getElementById("progressDot");
+        const currentTimeEl = document.getElementById("currentTime");
+        const totalTimeEl = document.getElementById("totalTime");
+        const statusEl = document.getElementById("status");
+
+        let totalDuration = 0; // from server (full song)
+        let blobUrl = null;
+
+        function formatMMSS(sec) {
+          if (!Number.isFinite(sec) || sec < 0) return "0:00";
+          const m = Math.floor(sec / 60);
+          const s = Math.floor(sec % 60);
+          return `${m}:${s.toString().padStart(2, "0")}`;
+        }
+
+        function updateProgress() {
+          const ct = audio.currentTime;
+          const dur = totalDuration > 0 ? totalDuration : audio.duration;
+          if (!Number.isFinite(dur) || dur <= 0) return;
+          const pct = (ct / dur) * 100;
+          progressPlayed.style.width = pct + "%";
+          progressDot.style.left = pct + "%";
+          const bufferedEnd = audio.buffered.length > 0 ? audio.buffered.end(0) : dur;
+          progressBuffered.style.width = (bufferedEnd / dur) * 100 + "%";
+          currentTimeEl.textContent = formatMMSS(ct);
+        }
+
+        function setTotalTime() {
+          const dur = totalDuration > 0 ? totalDuration : audio.duration;
+          totalTimeEl.textContent = formatMMSS(Number.isFinite(dur) ? dur : 0);
+        }
+
+        const ws = new WebSocket(wsUrl);
+        let firstBinary = true;
+
+        ws.onopen = () => {
+          statusEl.textContent = "Loading first chunk…";
+        };
+
+        ws.onmessage = (evt) => {
+          if (typeof evt.data === "string") {
+            try {
+              const msg = JSON.parse(evt.data);
+              if (typeof msg.duration === "number") {
+                totalDuration = msg.duration;
+                setTotalTime();
+              }
+            } catch (_e) {
+              // ignore
+            }
+            return;
+          }
+          if (evt.data instanceof Blob) {
+            if (firstBinary) {
+              firstBinary = false;
+              if (blobUrl) URL.revokeObjectURL(blobUrl);
+              blobUrl = URL.createObjectURL(evt.data);
+              audio.src = blobUrl;
+              audio.load();
+              statusEl.textContent = "Ready. Press Play.";
+              playBtn.disabled = false;
+              pauseBtn.disabled = false;
+              setTotalTime();
+            }
+          }
+        };
+
+        ws.onerror = () => {
+          statusEl.textContent = "WebSocket error.";
+        };
+
+        ws.onclose = () => {
+          statusEl.textContent = "Disconnected.";
+        };
+
+        playBtn.addEventListener("click", () => {
+          audio.play().catch(() => {});
+        });
+        pauseBtn.addEventListener("click", () => {
+          audio.pause();
+        });
+
+        audio.addEventListener("timeupdate", updateProgress);
+        audio.addEventListener("durationchange", setTotalTime);
+        audio.addEventListener("loadedmetadata", () => {
+          updateProgress();
+          setTotalTime();
+        });
+
+        progressWrap.addEventListener("click", (evt) => {
+          const dur = totalDuration > 0 ? totalDuration : audio.duration;
+          if (!Number.isFinite(dur) || dur <= 0) return;
+          const ratio = evt.offsetX / progressWrap.offsetWidth;
+          audio.currentTime = ratio * dur;
+          updateProgress();
+        });
+
+        setTotalTime();
+      })();
+    </script>
   </body>
 </html>
