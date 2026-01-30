@@ -4,5 +4,10 @@ music/
 # Cursor
 .cursor/
 
+# Build and cache
+dist/
+.astro/
+
 # Environment
 .env
+node_modules

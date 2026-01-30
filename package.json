@@ -1,0 +1,32 @@
+{
+  "name": "websocket-stream-test",
+  "type": "module",
+  "version": "0.0.1",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "node server/index.mjs",
+    "preprocess": "node scripts/preprocess.mjs",
+    "start": "npm run build && node server/index.mjs",
+    "test": "vitest run",
+    "lint": "eslint . --max-warnings 0"
+  },
+  "dependencies": {
+    "@astrojs/node": "^9.5.2",
+    "astro": "^5.0.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "@eslint/js": "^9.0.0",
+    "eslint": "^9.0.0",
+    "globals": "^15.0.0",
+    "vitest": "^1.6.0"
+  }
+}
