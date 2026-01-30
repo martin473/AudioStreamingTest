@@ -1,0 +1,8 @@
+# Music and chunks (source + preprocessed)
+music/
+
+# Cursor
+.cursor/
+
+# Environment
+.env

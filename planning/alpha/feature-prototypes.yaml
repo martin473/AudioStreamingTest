@@ -1,0 +1,60 @@
+# Feature prototypes – backend and frontend
+# Each entry describes a feature prototype: description, inputs, outputs.
+
+backend:
+  preprocess_mp3:
+    description: "Split MP3 from /music into timecoded chunks"
+    inputs: path to MP3
+    outputs: chunk files + index (chunk_id, start_s, end_s, file_path)
+    chunks: [30s with header placeholder, then 10s, tail]
+
+  chunk_index:
+    description: "Map timecode (seconds) to chunk id and file path"
+    inputs: timecode_s
+    outputs: chunk_id, start_s, end_s, path
+
+  http_ws_server:
+    description: "Node HTTP server, Astro middleware, WS upgrade"
+    inputs: request
+    outputs: HTML (Astro) or WS connection
+
+  send_initial_chunk:
+    description: "On WS connect, send first 30s chunk (binary)"
+    inputs: socket
+    outputs: binary frame(s)
+
+  send_chunk_by_request:
+    description: "On message (timecode or next), send that chunk (binary)"
+    inputs: socket, timecode_s or next
+    outputs: binary frame(s)
+
+frontend:
+  ws_connect_buffer:
+    description: "Connect WS on load; receive and buffer first chunk"
+    inputs: page load
+    outputs: buffer ready for playback
+
+  play_pause:
+    description: "Play / Pause controls; start from current time"
+    inputs: user click
+    outputs: playback state
+
+  progress_display:
+    description: "Bar: played (white), dot (position), buffered (grey), rest"
+    inputs: currentTime, duration, buffered ranges
+    outputs: visual bar
+
+  timestamps_display:
+    description: "Current mm:ss and total mm:ss; update on timeupdate/seek"
+    inputs: currentTime, duration
+    outputs: two labels
+
+  seek_on_click:
+    description: "Click bar -> seek; request chunk for timecode; play when ready"
+    inputs: click x, bar width, duration
+    outputs: new currentTime, chunk request, playback from position
+
+  local_cache_check:
+    description: "Before WS chunk request, check cache; use if hit, else request and store"
+    inputs: chunk_id or timecode
+    outputs: chunk bytes (from cache or WS)
