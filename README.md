@@ -55,7 +55,10 @@ Server always responds with raw binary chunk data (no JSON wrapper).
 | `npm run build`      | Build Astro (output in `dist/`).             |
 | `npm run preview`    | Run custom server (HTTP + WS). Requires `npm run build` first. |
 | `npm start`          | Build then run server.                       |
-| `npm run dev`       | Astro dev server (no WebSocket; use `preview` for full Phase 1). |
+| `npm run dev`       | Astro dev server on **port 4325** (no WebSocket; use `preview` for full app on 4321). |
+| `npm run e2e`       | Run Playwright e2e tests (requires server; see [tests/e2e/README.md](tests/e2e/README.md)). |
+| `npm run e2e:seek`  | Seek-past-buffer repro test. |
+| `npm run e2e:debug`| Same + dump WebSocket/console to `tests/e2e/debug-seek-output.txt`. |
 
 ## Phase 1 checklist
 

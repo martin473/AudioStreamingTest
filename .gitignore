@@ -8,6 +8,12 @@ music/
 dist/
 .astro/
 
+# E2E debug output and Playwright
+tests/e2e/debug-seek-output.txt
+test-results/
+playwright-report/
+playwright/.cache/
+
 # Environment
 .env
 node_modules

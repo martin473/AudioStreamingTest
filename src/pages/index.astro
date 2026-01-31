@@ -88,8 +88,7 @@
     <h1>Audio Streaming Test</h1>
     <p class="status" id="status">Connecting…</p>
     <div class="controls">
-      <button type="button" id="playBtn" disabled>Play</button>
-      <button type="button" id="pauseBtn" disabled>Pause</button>
+      <button type="button" id="playPauseBtn" disabled>Play</button>
     </div>
     <div class="progress-wrap" id="progressWrap">
       <div class="progress-bar progress-buffered" id="progressBuffered"></div>
@@ -100,15 +99,20 @@
       <span id="currentTime">0:00</span>
       <span id="totalTime">0:00</span>
     </div>
+    <details class="debug" id="debugDetails" style="margin-top:1rem; font-size:0.75rem; color:#666;">
+      <summary>Debug: chunk flow</summary>
+      <pre id="debugLog" style="margin:0.25rem 0; white-space:pre-wrap; word-break:break-all;"></pre>
+      <p style="margin:0;"><strong>Flow:</strong> At <code>bufferEnd - 5s</code> we request next chunk. When it arrives we store it. At <code>bufferEnd - 0.05s</code> we switch to that chunk (single blob). If we reach the end without a chunk, we show "Loading next chunk…" and re-request.</p>
+    </details>
     <audio id="audio" preload="none"></audio>
 
     <script>
+      import { getChunkRange as getChunkRangeUtil, cacheKey as cacheKeyUtil, formatMMSS as formatMMSSUtil, getSongCurrentTimeClamped, shouldRequestNext, shouldSwitchAtBoundary } from "../lib/audioChunkUtils.js";
       (function () {
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsUrl = `${protocol}//${window.location.host}/ws`;
         const audio = document.getElementById("audio");
-        const playBtn = document.getElementById("playBtn");
-        const pauseBtn = document.getElementById("pauseBtn");
+        const playPauseBtn = document.getElementById("playPauseBtn");
         const progressWrap = document.getElementById("progressWrap");
         const progressPlayed = document.getElementById("progressPlayed");
         const progressBuffered = document.getElementById("progressBuffered");
@@ -119,24 +123,57 @@
 
         let totalDuration = 0; // from server (full song)
         let blobUrl = null;
+        const chunkBuffers = []; // ArrayBuffers
+        const chunkRanges = []; // { start_s, end_s } per chunk, for buffer end and seek
+        let bufferStartTime = 0; // start of current buffer in song time
+        const BUFFER_AHEAD_SEC = 5;
+        let nextRequested = false;
+        const chunkRangeQueue = []; // ranges in receive order
+        const binaryPromiseQueue = []; // arrayBuffer() promises in receive order; process pairs strictly in order
+        let pendingSeekTime = null;
+        let pendingSeekRange = null; // for cache key and UI; server range is source of truth for apply
+        let pendingRequestKind = null; // "seek" | "next" | null; avoid applying stale seek response as append
+        let seekSatisfiedFromCache = false; // true after applying seek from cache; next binary is stale seek response
+        let loadId = 0; // single-flight: only latest setBufferFromChunks callbacks revoke/apply
+        let pendingNextChunk = null; // { buffer, range } when we have "next" chunk; switch at buffer end (no concat)
+        let pendingNextRange = null;
+        const CACHE_NAME = "audio-chunks";
+
+        const debugLogEl = document.getElementById("debugLog");
+        const debugEntries = [];
+        function debugLog(msg) {
+          const t = typeof performance !== "undefined" && performance.now ? performance.now().toFixed(0) : "";
+          debugEntries.push(`[${t}] ${msg}`);
+          if (debugEntries.length > 20) debugEntries.shift();
+          if (debugLogEl) debugLogEl.textContent = debugEntries.join("\n");
+        }
+
+        function getChunkRange(timeSec) {
+          return getChunkRangeUtil(timeSec, totalDuration);
+        }
+
+        function cacheKey(start_s, end_s) {
+          return cacheKeyUtil(start_s, end_s, CACHE_NAME);
+        }
 
         function formatMMSS(sec) {
-          if (!Number.isFinite(sec) || sec < 0) return "0:00";
-          const m = Math.floor(sec / 60);
-          const s = Math.floor(sec % 60);
-          return `${m}:${s.toString().padStart(2, "0")}`;
+          return formatMMSSUtil(sec);
+        }
+
+        function getSongCurrentTime() {
+          return getSongCurrentTimeClamped(bufferStartTime, audio.currentTime, getBufferEndSec());
         }
 
         function updateProgress() {
-          const ct = audio.currentTime;
+          const songTime = getSongCurrentTime();
           const dur = totalDuration > 0 ? totalDuration : audio.duration;
           if (!Number.isFinite(dur) || dur <= 0) return;
-          const pct = (ct / dur) * 100;
+          const pct = (songTime / dur) * 100;
           progressPlayed.style.width = pct + "%";
           progressDot.style.left = pct + "%";
-          const bufferedEnd = audio.buffered.length > 0 ? audio.buffered.end(0) : dur;
+          const bufferedEnd = chunkRanges.length ? chunkRanges[chunkRanges.length - 1].end_s : bufferStartTime + (audio.buffered.length > 0 ? audio.buffered.end(0) : 0);
           progressBuffered.style.width = (bufferedEnd / dur) * 100 + "%";
-          currentTimeEl.textContent = formatMMSS(ct);
+          currentTimeEl.textContent = formatMMSS(songTime);
         }
 
         function setTotalTime() {
@@ -144,8 +181,63 @@
           totalTimeEl.textContent = formatMMSS(Number.isFinite(dur) ? dur : 0);
         }
 
+        function getBufferEndSec() {
+          if (chunkRanges.length === 0) return bufferStartTime;
+          return chunkRanges[chunkRanges.length - 1].end_s;
+        }
+
+        function setBufferFromChunks(ranges, buffers, startTime, seekToTime) {
+          loadId += 1;
+          const myLoadId = loadId;
+          chunkBuffers.length = 0;
+          chunkBuffers.push(...buffers);
+          chunkRanges.length = 0;
+          chunkRanges.push(...ranges);
+          bufferStartTime = startTime;
+          const totalLen = chunkBuffers.reduce((s, b) => s + b.byteLength, 0);
+          const out = new Uint8Array(totalLen);
+          let offset = 0;
+          for (const b of chunkBuffers) {
+            out.set(new Uint8Array(b), offset);
+            offset += b.byteLength;
+          }
+          const newBlob = new Blob([out.buffer], { type: "audio/mpeg" });
+          const oldUrl = blobUrl;
+          blobUrl = URL.createObjectURL(newBlob);
+          audio.src = blobUrl;
+          audio.load();
+          const afterLoad = () => {
+            if (myLoadId !== loadId) return;
+            if (Number.isFinite(seekToTime) && seekToTime >= bufferStartTime && seekToTime <= getBufferEndSec()) {
+              const seekOffset = Math.min(seekToTime - bufferStartTime, getBufferEndSec() - bufferStartTime);
+              audio.currentTime = seekOffset;
+            }
+            const urlToRevoke = oldUrl;
+            setTimeout(() => {
+              if (urlToRevoke) URL.revokeObjectURL(urlToRevoke);
+            }, 0);
+            audio.removeEventListener("canplay", afterLoad);
+            audio.removeEventListener("error", onErr);
+            statusEl.textContent = "Ready.";
+            setTotalTime();
+            updateProgress();
+          };
+          const onErr = () => {
+            if (myLoadId !== loadId) return;
+            audio.removeEventListener("canplay", afterLoad);
+            audio.removeEventListener("error", onErr);
+            if (oldUrl) {
+              blobUrl = oldUrl;
+              audio.src = oldUrl;
+              audio.load();
+            }
+            statusEl.textContent = "Error loading audio.";
+          };
+          audio.addEventListener("canplay", afterLoad);
+          audio.addEventListener("error", onErr);
+        }
+
         const ws = new WebSocket(wsUrl);
-        let firstBinary = true;
 
         ws.onopen = () => {
           statusEl.textContent = "Loading first chunk…";
@@ -159,25 +251,122 @@
                 totalDuration = msg.duration;
                 setTotalTime();
               }
+              if (msg.error === "chunk_unavailable") {
+                pendingSeekTime = null;
+                pendingSeekRange = null;
+                chunkRangeQueue.length = 0;
+                binaryPromiseQueue.length = 0;
+                pendingRequestKind = null;
+                seekSatisfiedFromCache = false;
+                statusEl.textContent = "Chunk unavailable.";
+                return;
+              }
+              if (typeof msg.start_s === "number" && typeof msg.end_s === "number") {
+                chunkRangeQueue.push({ start_s: msg.start_s, end_s: msg.end_s });
+                processNextPair();
+              }
             } catch (_e) {
               // ignore
             }
             return;
           }
-          if (evt.data instanceof Blob) {
-            if (firstBinary) {
-              firstBinary = false;
-              if (blobUrl) URL.revokeObjectURL(blobUrl);
-              blobUrl = URL.createObjectURL(evt.data);
+              if (evt.data instanceof Blob) {
+            binaryPromiseQueue.push(evt.data.arrayBuffer());
+            processNextPair();
+          }
+        };
+
+        function processNextPair() {
+          if (chunkRangeQueue.length === 0 || binaryPromiseQueue.length === 0) return;
+          const range = chunkRangeQueue.shift();
+          const promise = binaryPromiseQueue.shift();
+          promise.then((ab) => {
+            if (ab.byteLength === 0) {
+              if (pendingSeekTime != null) {
+                pendingSeekTime = null;
+                pendingSeekRange = null;
+                pendingRequestKind = null;
+                statusEl.textContent = "Error: empty chunk.";
+              }
+              processNextPair();
+              return;
+            }
+            if (pendingSeekTime != null) {
+              const seekTo = pendingSeekTime;
+              if (seekTo >= range.start_s && seekTo < range.end_s) {
+                chunkBuffers.length = 0;
+                chunkRanges.length = 0;
+                chunkBuffers.push(ab);
+                chunkRanges.push(range);
+                bufferStartTime = range.start_s;
+                pendingSeekTime = null;
+                pendingSeekRange = null;
+                pendingRequestKind = null;
+                nextRequested = false;
+                pendingNextChunk = null;
+                pendingNextRange = null;
+                setBufferFromChunks(chunkRanges, chunkBuffers, bufferStartTime, seekTo);
+                caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+              } else {
+                caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+              }
+              processNextPair();
+              return;
+            }
+            if ((pendingRequestKind === "seek" || seekSatisfiedFromCache)) {
+              pendingRequestKind = null;
+              seekSatisfiedFromCache = false;
+              caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+              processNextPair();
+              return;
+            }
+            if (chunkBuffers.length === 0) {
+              chunkRanges.push(range);
+              chunkBuffers.push(ab);
+              pendingRequestKind = null;
+              nextRequested = false;
+              const totalLen = chunkBuffers.reduce((s, b) => s + b.byteLength, 0);
+              const out = new Uint8Array(totalLen);
+              out.set(new Uint8Array(ab), 0);
+              blobUrl = URL.createObjectURL(new Blob([out.buffer], { type: "audio/mpeg" }));
               audio.src = blobUrl;
               audio.load();
               statusEl.textContent = "Ready. Press Play.";
-              playBtn.disabled = false;
-              pauseBtn.disabled = false;
+              playPauseBtn.disabled = false;
               setTotalTime();
+              updateProgress();
+              caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+              processNextPair();
+              return;
             }
-          }
-        };
+            if (pendingRequestKind === "next") {
+              pendingRequestKind = null;
+              const bufferEnd = getBufferEndSec();
+              if (range.start_s !== bufferEnd) {
+                debugLog(`next chunk mismatch: got ${range.start_s}-${range.end_s}s, need chunk starting at ${bufferEnd}s; discarding and will re-request`);
+                caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+                nextRequested = false;
+                processNextPair();
+                return;
+              }
+              nextRequested = false;
+              pendingNextChunk = ab;
+              pendingNextRange = range;
+              debugLog(`next received: range ${range.start_s}-${range.end_s}s`);
+              caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+              setTotalTime();
+              updateProgress();
+              if (shouldSwitchAtBoundary(getSongCurrentTime(), getBufferEndSec())) {
+                debugLog("already at boundary, switching immediately");
+                setTimeout(() => switchToPendingNextChunk(), 0);
+              }
+              processNextPair();
+              return;
+            }
+            caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+            processNextPair();
+          }).catch(() => { processNextPair(); });
+        }
 
         ws.onerror = () => {
           statusEl.textContent = "WebSocket error.";
@@ -187,26 +376,221 @@
           statusEl.textContent = "Disconnected.";
         };
 
-        playBtn.addEventListener("click", () => {
-          audio.play().catch(() => {});
-        });
-        pauseBtn.addEventListener("click", () => {
-          audio.pause();
+        playPauseBtn.addEventListener("click", () => {
+          if (audio.paused) {
+            audio.play().catch(() => {});
+          } else {
+            audio.pause();
+          }
         });
 
-        audio.addEventListener("timeupdate", updateProgress);
+        function updatePlayPauseLabel() {
+          playPauseBtn.textContent = audio.paused ? "Play" : "Pause";
+        }
+        audio.addEventListener("play", updatePlayPauseLabel);
+        audio.addEventListener("pause", updatePlayPauseLabel);
+
+        function switchToPendingNextChunk() {
+          if (!pendingNextChunk || !pendingNextRange) return;
+          const range = pendingNextRange;
+          const ab = pendingNextChunk;
+          const wasPlaying = !audio.paused;
+          pendingNextChunk = null;
+          pendingNextRange = null;
+          debugLog(`switch at boundary: new range ${range.start_s}-${range.end_s}s (bufferStartTime=${range.start_s})`);
+          chunkBuffers.length = 0;
+          chunkRanges.length = 0;
+          chunkBuffers.push(ab);
+          chunkRanges.push(range);
+          bufferStartTime = range.start_s;
+          const oldUrl = blobUrl;
+          blobUrl = URL.createObjectURL(new Blob([ab], { type: "audio/mpeg" }));
+          audio.src = blobUrl;
+          audio.load();
+          const afterSwitch = () => {
+            audio.currentTime = 0;
+            if (oldUrl) {
+              const urlToRevoke = oldUrl;
+              setTimeout(() => URL.revokeObjectURL(urlToRevoke), 0);
+            }
+            audio.removeEventListener("canplay", afterSwitch);
+            audio.removeEventListener("loadedmetadata", onMeta);
+            audio.removeEventListener("error", onSwitchErr);
+            statusEl.textContent = "Ready.";
+            setTotalTime();
+            updateProgress();
+            if (wasPlaying) audio.play().catch(() => {});
+          };
+          const onMeta = () => {
+            if (audio.currentTime !== 0) {
+              audio.currentTime = 0;
+              debugLog("clamped currentTime to 0 after metadata (blob may have wrong duration)");
+            }
+          };
+          const onSwitchErr = () => {
+            audio.removeEventListener("canplay", afterSwitch);
+            audio.removeEventListener("loadedmetadata", onMeta);
+            audio.removeEventListener("error", onSwitchErr);
+            pendingNextChunk = ab;
+            pendingNextRange = range;
+            debugLog(`switch error: restored previous blob`);
+            if (oldUrl) {
+              blobUrl = oldUrl;
+              audio.src = oldUrl;
+              audio.load();
+            }
+            statusEl.textContent = "Error switching chunk.";
+          };
+          audio.addEventListener("canplay", afterSwitch);
+          audio.addEventListener("loadedmetadata", onMeta);
+          audio.addEventListener("error", onSwitchErr);
+        }
+
+        audio.addEventListener("timeupdate", () => {
+          updateProgress();
+          const songTime = getSongCurrentTime();
+          const bufferEnd = getBufferEndSec();
+          if (pendingNextChunk && pendingNextRange && shouldSwitchAtBoundary(songTime, bufferEnd)) {
+            switchToPendingNextChunk();
+            return;
+          }
+          if (shouldRequestNext(songTime, bufferEnd, totalDuration, BUFFER_AHEAD_SEC) && !nextRequested && !pendingNextChunk) {
+            nextRequested = true;
+            pendingRequestKind = "next";
+            debugLog(`next requested at songTime=${songTime.toFixed(1)}s (bufferEnd=${bufferEnd}, 5s ahead)`);
+            ws.send(JSON.stringify({ next: true, bufferEnd }));
+          }
+          if (bufferEnd < totalDuration && shouldSwitchAtBoundary(songTime, bufferEnd) && !pendingNextChunk && nextRequested) {
+            debugLog(`at boundary ${songTime.toFixed(1)}s but next chunk not loaded yet`);
+          }
+        });
         audio.addEventListener("durationchange", setTotalTime);
         audio.addEventListener("loadedmetadata", () => {
           updateProgress();
           setTotalTime();
         });
+        audio.addEventListener("ended", () => {
+          const bufferEnd = getBufferEndSec();
+          if (totalDuration <= 0 || bufferEnd >= totalDuration) return;
+          if (pendingNextChunk && pendingNextRange) {
+            debugLog("ended with next chunk already loaded; switching");
+            switchToPendingNextChunk();
+            return;
+          }
+          const nextRange = getChunkRange(bufferEnd);
+          if (!nextRange) {
+            nextRequested = false;
+            pendingRequestKind = "next";
+            statusEl.textContent = "Loading next chunk…";
+            ws.send(JSON.stringify({ next: true, bufferEnd }));
+            return;
+          }
+          const key = cacheKey(nextRange.start_s, nextRange.end_s);
+          caches.open(CACHE_NAME).then((cache) => cache.match(key)).then((cachedResp) => {
+            if (!cachedResp) {
+              debugLog("ended at buffer end without next chunk; re-requesting");
+              nextRequested = false;
+              pendingRequestKind = "next";
+              statusEl.textContent = "Loading next chunk…";
+              ws.send(JSON.stringify({ next: true, bufferEnd }));
+              return;
+            }
+            cachedResp.arrayBuffer().then((ab) => {
+              const wasPlaying = !audio.paused;
+              chunkBuffers.length = 0;
+              chunkRanges.length = 0;
+              chunkBuffers.push(ab);
+              chunkRanges.push(nextRange);
+              bufferStartTime = nextRange.start_s;
+              nextRequested = false;
+              pendingNextChunk = null;
+              pendingNextRange = null;
+              const oldUrl = blobUrl;
+              blobUrl = URL.createObjectURL(new Blob([ab], { type: "audio/mpeg" }));
+              audio.src = blobUrl;
+              audio.load();
+              const onCanPlay = () => {
+                audio.currentTime = 0;
+                if (oldUrl) setTimeout(() => URL.revokeObjectURL(oldUrl), 0);
+                audio.removeEventListener("canplay", onCanPlay);
+                audio.removeEventListener("error", onErr);
+                statusEl.textContent = "Ready.";
+                setTotalTime();
+                updateProgress();
+                if (wasPlaying) audio.play().catch(() => {});
+              };
+              const onErr = () => {
+                audio.removeEventListener("canplay", onCanPlay);
+                audio.removeEventListener("error", onErr);
+                if (oldUrl) {
+                  blobUrl = oldUrl;
+                  audio.src = oldUrl;
+                  audio.load();
+                }
+                nextRequested = false;
+                pendingRequestKind = "next";
+                statusEl.textContent = "Loading next chunk…";
+                ws.send(JSON.stringify({ next: true, bufferEnd }));
+              };
+              audio.addEventListener("canplay", onCanPlay);
+              audio.addEventListener("error", onErr);
+              debugLog("ended; next chunk found in cache, switching");
+            });
+          }).catch(() => {
+            nextRequested = false;
+            pendingRequestKind = "next";
+            statusEl.textContent = "Loading next chunk…";
+            ws.send(JSON.stringify({ next: true, bufferEnd }));
+          });
+        });
 
         progressWrap.addEventListener("click", (evt) => {
           const dur = totalDuration > 0 ? totalDuration : audio.duration;
           if (!Number.isFinite(dur) || dur <= 0) return;
-          const ratio = evt.offsetX / progressWrap.offsetWidth;
-          audio.currentTime = ratio * dur;
-          updateProgress();
+          const ratio = Math.max(0, Math.min(1, evt.offsetX / progressWrap.offsetWidth));
+          const targetTime = ratio * dur;
+          const bufferEnd = getBufferEndSec();
+          if (targetTime >= bufferStartTime && targetTime <= bufferEnd) {
+            audio.currentTime = targetTime - bufferStartTime;
+            updateProgress();
+            return;
+          }
+          const range = getChunkRange(targetTime);
+          if (!range) return;
+          const key = cacheKey(range.start_s, range.end_s);
+          statusEl.textContent = "Loading…";
+          pendingSeekTime = targetTime;
+          pendingSeekRange = range;
+          pendingRequestKind = "seek";
+          pendingNextChunk = null;
+          pendingNextRange = null;
+          caches.open(CACHE_NAME).then((cache) => cache.match(key)).then((cachedResp) => {
+            if (cachedResp) {
+              return cachedResp.arrayBuffer().then((ab) => {
+                if (pendingSeekTime !== targetTime) return;
+                chunkBuffers.length = 0;
+                chunkRanges.length = 0;
+                chunkBuffers.push(ab);
+                chunkRanges.push(range);
+                bufferStartTime = range.start_s;
+                nextRequested = false;
+                pendingSeekTime = null;
+                pendingSeekRange = null;
+                pendingRequestKind = null;
+                seekSatisfiedFromCache = true;
+                pendingNextChunk = null;
+                pendingNextRange = null;
+                setBufferFromChunks(chunkRanges, chunkBuffers, bufferStartTime, targetTime);
+              });
+              return;
+            }
+            ws.send(JSON.stringify({ t: targetTime }));
+          }).catch(() => {
+            statusEl.textContent = "Error loading chunk.";
+            pendingSeekTime = null;
+            pendingSeekRange = null;
+            pendingRequestKind = null;
+          });
         });
 
         setTotalTime();

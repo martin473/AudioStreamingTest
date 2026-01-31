@@ -24,3 +24,16 @@ export function getChunk(index, sec) {
 export function getChunkByIndex(index, i) {
   return index[i] ?? null;
 }
+
+/**
+ * Chunk that starts at startSec (for "next" request: client sends bufferEnd, we send chunk starting at bufferEnd).
+ * @param {Array<{ id: number, start_s: number, end_s: number, path: string }>} index
+ * @param {number} startSec
+ * @returns {typeof index[0] | null}
+ */
+export function getChunkStartingAt(index, startSec) {
+  const s = Number(startSec);
+  if (!Number.isFinite(s) || s < 0) return null;
+  const entry = index.find((c) => c.start_s === s);
+  return entry ?? null;
+}

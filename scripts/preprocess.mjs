@@ -1,7 +1,8 @@
 /**
  * Phase 1.1: Preprocess MP3 from /music into timecoded chunks.
  * Uses fluent-ffmpeg (requires ffmpeg on PATH or @ffmpeg-installer/ffmpeg).
- * Output: music/chunks/chunk_0.bin, chunk_1.bin, ... and chunk_index.json.
+ * Re-encodes each segment (no -c copy) so each chunk is a valid standalone MP3 and decodes
+ * when played alone (e.g. at 30s boundary or after seek). Output: chunk_0.mp3, chunk_1.mp3, ...
  */
 
 import fs from "node:fs";
@@ -56,7 +57,7 @@ function extractSegment(inputPath, outputPath, startSec, durationSec) {
     ffmpeg(inputPath)
       .setStartTime(startSec)
       .setDuration(durationSec)
-      .outputOptions(["-c copy"])
+      .audioCodec("libmp3lame")
       .output(outputPath)
       .on("end", () => resolve())
       .on("error", reject)

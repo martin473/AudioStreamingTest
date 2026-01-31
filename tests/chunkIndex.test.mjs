@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { getChunk, getChunkByIndex } from "../server/chunkIndex.mjs";
+import { getChunk, getChunkByIndex, getChunkStartingAt } from "../server/chunkIndex.mjs";
 
 const fixtureIndex = [
   { id: 0, start_s: 0, end_s: 30, path: "chunk_0.mp3" },
@@ -56,5 +56,19 @@ describe("getChunkByIndex", () => {
   it("returns null for out-of-range index", () => {
     expect(getChunkByIndex(fixtureIndex, 4)).toBeNull();
     expect(getChunkByIndex(fixtureIndex, -1)).toBeNull();
+  });
+});
+
+describe("getChunkStartingAt", () => {
+  it("returns chunk that starts at given time", () => {
+    expect(getChunkStartingAt(fixtureIndex, 0)).toEqual(fixtureIndex[0]);
+    expect(getChunkStartingAt(fixtureIndex, 30)).toEqual(fixtureIndex[1]);
+    expect(getChunkStartingAt(fixtureIndex, 50)).toEqual(fixtureIndex[3]);
+  });
+
+  it("returns null when no chunk starts at that time", () => {
+    expect(getChunkStartingAt(fixtureIndex, 25)).toBeNull();
+    expect(getChunkStartingAt(fixtureIndex, 55.5)).toBeNull();
+    expect(getChunkStartingAt(fixtureIndex, -1)).toBeNull();
   });
 });

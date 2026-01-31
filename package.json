@@ -9,7 +9,11 @@
     "preprocess": "node scripts/preprocess.mjs",
     "start": "npm run build && node server/index.mjs",
     "test": "vitest run",
-    "lint": "eslint . --max-warnings 0"
+    "lint": "eslint . --max-warnings 0",
+    "e2e:seek": "playwright test tests/e2e/seek-past-buffer.spec.js",
+    "e2e:chunk-flow": "playwright test tests/e2e/chunk-flow.spec.js",
+    "e2e:debug": "playwright test tests/e2e/debug-seek-websocket.spec.js",
+    "e2e": "playwright test"
   },
   "dependencies": {
     "@astrojs/node": "^9.5.2",
@@ -22,9 +26,10 @@
     "@ffprobe-installer/ffprobe": "^2.1.2"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
+    "@playwright/test": "^1.58.1",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
-    "@eslint/js": "^9.0.0",
     "eslint": "^9.0.0",
     "globals": "^15.0.0",
     "vitest": "^1.6.0"

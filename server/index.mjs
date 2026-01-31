@@ -9,7 +9,7 @@ import path from "node:path";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
-import { getChunk, getChunkByIndex } from "./chunkIndex.mjs";
+import { getChunk, getChunkByIndex, getChunkStartingAt } from "./chunkIndex.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -45,9 +45,31 @@ async function createServer() {
         const ext = path.extname(filePath);
         const types = { ".html": "text/html", ".js": "application/javascript", ".css": "text/css", ".json": "application/json", ".ico": "image/x-icon" };
         res.setHeader("Content-Type", types[ext] ?? "application/octet-stream");
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader("Cache-Control", "public, max-age=31536000");
         res.end(fs.readFileSync(filePath));
         return;
       }
+      // Missing static asset (e.g. old build hash): 404, never HTML (avoids MIME/sniff errors)
+      res.writeHead(404, { "Content-Type": "text/plain", "X-Content-Type-Options": "nosniff" });
+      res.end("Not Found");
+      return;
+    }
+
+    // Document (/) with no-store so browser always gets fresh HTML after rebuilds
+    const isDocument = pathname === "/" || pathname === "" || pathname === "/index.html";
+    if (isDocument) {
+      const origSetHeader = res.setHeader.bind(res);
+      res.setHeader = (name, value) => {
+        if (String(name).toLowerCase() === "cache-control") return origSetHeader("Cache-Control", "no-store");
+        return origSetHeader(name, value);
+      };
+      const origWriteHead = res.writeHead.bind(res);
+      res.writeHead = function (statusCode, ...args) {
+        origSetHeader("Cache-Control", "no-store");
+        return origWriteHead(statusCode, ...args);
+      };
+      origSetHeader("Cache-Control", "no-store");
     }
 
     handler(req, res);
@@ -81,6 +103,7 @@ async function createServer() {
     const first = chunkIndex[0];
     if (first) {
       try {
+        ws.send(JSON.stringify({ start_s: first.start_s, end_s: first.end_s }), { binary: false });
         const buf = readChunkFile(first);
         ws.send(buf, { binary: true });
         lastSentChunkIndex = 0;
@@ -101,15 +124,26 @@ async function createServer() {
       if (typeof payload.t === "number") {
         entry = getChunk(chunkIndex, payload.t);
       } else if (payload.next === true) {
-        entry = getChunkByIndex(chunkIndex, lastSentChunkIndex + 1);
+        if (typeof payload.bufferEnd === "number") {
+          entry = getChunkStartingAt(chunkIndex, payload.bufferEnd);
+        }
+        if (!entry) {
+          entry = getChunkByIndex(chunkIndex, lastSentChunkIndex + 1);
+        }
       }
       if (entry) {
         try {
+          ws.send(JSON.stringify({ start_s: entry.start_s, end_s: entry.end_s }), { binary: false });
           const buf = readChunkFile(entry);
           ws.send(buf, { binary: true });
           lastSentChunkIndex = entry.id;
         } catch (err) {
           console.error("Failed to send chunk:", err.message);
+          try {
+            ws.send(JSON.stringify({ error: "chunk_unavailable", start_s: entry.start_s, end_s: entry.end_s }), { binary: false });
+          } catch (sendErr) {
+            console.error("Failed to send chunk_unavailable:", sendErr.message);
+          }
         }
       }
     });
