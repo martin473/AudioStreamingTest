@@ -102,7 +102,7 @@
     <details class="debug" id="debugDetails" style="margin-top:1rem; font-size:0.75rem; color:#666;">
       <summary>Debug: chunk flow</summary>
       <pre id="debugLog" style="margin:0.25rem 0; white-space:pre-wrap; word-break:break-all;"></pre>
-      <p style="margin:0;"><strong>Flow:</strong> At <code>bufferEnd - 5s</code> we request next chunk. When it arrives we store it. At <code>bufferEnd - 0.05s</code> we switch to that chunk (single blob). If we reach the end without a chunk, we show "Loading next chunk…" and re-request.</p>
+      <p style="margin:0;"><strong>Flow:</strong> At <code>bufferEnd - 10s</code> we request next chunk. When it arrives we store it. At <code>bufferEnd - 0.5s</code> we switch to that chunk (single blob). If chunk arrives at boundary we switch immediately (sync). If we reach the end without a chunk, we show "Loading next chunk…" and re-request.</p>
     </details>
     <audio id="audio" preload="none"></audio>
 
@@ -126,7 +126,7 @@
         const chunkBuffers = []; // ArrayBuffers
         const chunkRanges = []; // { start_s, end_s } per chunk, for buffer end and seek
         let bufferStartTime = 0; // start of current buffer in song time
-        const BUFFER_AHEAD_SEC = 5;
+        const BUFFER_AHEAD_SEC = 10;
         let nextRequested = false;
         const chunkRangeQueue = []; // ranges in receive order
         const binaryPromiseQueue = []; // arrayBuffer() promises in receive order; process pairs strictly in order
@@ -137,6 +137,7 @@
         let loadId = 0; // single-flight: only latest setBufferFromChunks callbacks revoke/apply
         let pendingNextChunk = null; // { buffer, range } when we have "next" chunk; switch at buffer end (no concat)
         let pendingNextRange = null;
+        let isSwitching = false; // true while we've set new src but not yet canplay (ignore stale ended)
         const CACHE_NAME = "audio-chunks";
 
         const debugLogEl = document.getElementById("debugLog");
@@ -356,9 +357,9 @@
               caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
               setTotalTime();
               updateProgress();
-              if (shouldSwitchAtBoundary(getSongCurrentTime(), getBufferEndSec())) {
-                debugLog("already at boundary, switching immediately");
-                setTimeout(() => switchToPendingNextChunk(), 0);
+              if (shouldSwitchAtBoundary(getSongCurrentTime(), getBufferEndSec(), 0.5)) {
+                debugLog("already at boundary, switching immediately (sync)");
+                switchToPendingNextChunk();
               }
               processNextPair();
               return;
@@ -390,13 +391,15 @@
         audio.addEventListener("play", updatePlayPauseLabel);
         audio.addEventListener("pause", updatePlayPauseLabel);
 
-        function switchToPendingNextChunk() {
+        function switchToPendingNextChunk(opts) {
           if (!pendingNextChunk || !pendingNextRange) return;
           const range = pendingNextRange;
           const ab = pendingNextChunk;
+          const forceResume = opts && opts.forceResume;
           const wasPlaying = !audio.paused;
           pendingNextChunk = null;
           pendingNextRange = null;
+          isSwitching = true;
           debugLog(`switch at boundary: new range ${range.start_s}-${range.end_s}s (bufferStartTime=${range.start_s})`);
           chunkBuffers.length = 0;
           chunkRanges.length = 0;
@@ -408,6 +411,7 @@
           audio.src = blobUrl;
           audio.load();
           const afterSwitch = () => {
+            isSwitching = false;
             audio.currentTime = 0;
             if (oldUrl) {
               const urlToRevoke = oldUrl;
@@ -419,7 +423,7 @@
             statusEl.textContent = "Ready.";
             setTotalTime();
             updateProgress();
-            if (wasPlaying) audio.play().catch(() => {});
+            if (wasPlaying || forceResume) audio.play().catch(() => {});
           };
           const onMeta = () => {
             if (audio.currentTime !== 0) {
@@ -428,6 +432,7 @@
             }
           };
           const onSwitchErr = () => {
+            isSwitching = false;
             audio.removeEventListener("canplay", afterSwitch);
             audio.removeEventListener("loadedmetadata", onMeta);
             audio.removeEventListener("error", onSwitchErr);
@@ -450,7 +455,7 @@
           updateProgress();
           const songTime = getSongCurrentTime();
           const bufferEnd = getBufferEndSec();
-          if (pendingNextChunk && pendingNextRange && shouldSwitchAtBoundary(songTime, bufferEnd)) {
+          if (pendingNextChunk && pendingNextRange && shouldSwitchAtBoundary(songTime, bufferEnd, 0.5)) {
             switchToPendingNextChunk();
             return;
           }
@@ -460,7 +465,7 @@
             debugLog(`next requested at songTime=${songTime.toFixed(1)}s (bufferEnd=${bufferEnd}, 5s ahead)`);
             ws.send(JSON.stringify({ next: true, bufferEnd }));
           }
-          if (bufferEnd < totalDuration && shouldSwitchAtBoundary(songTime, bufferEnd) && !pendingNextChunk && nextRequested) {
+          if (bufferEnd < totalDuration && shouldSwitchAtBoundary(songTime, bufferEnd, 0.5) && !pendingNextChunk && nextRequested) {
             debugLog(`at boundary ${songTime.toFixed(1)}s but next chunk not loaded yet`);
           }
         });
@@ -470,11 +475,12 @@
           setTotalTime();
         });
         audio.addEventListener("ended", () => {
+          if (isSwitching) return;
           const bufferEnd = getBufferEndSec();
           if (totalDuration <= 0 || bufferEnd >= totalDuration) return;
           if (pendingNextChunk && pendingNextRange) {
             debugLog("ended with next chunk already loaded; switching");
-            switchToPendingNextChunk();
+            switchToPendingNextChunk({ forceResume: true });
             return;
           }
           const nextRange = getChunkRange(bufferEnd);
@@ -496,7 +502,8 @@
               return;
             }
             cachedResp.arrayBuffer().then((ab) => {
-              const wasPlaying = !audio.paused;
+              const fromEnded = true;
+              isSwitching = true;
               chunkBuffers.length = 0;
               chunkRanges.length = 0;
               chunkBuffers.push(ab);
@@ -510,6 +517,7 @@
               audio.src = blobUrl;
               audio.load();
               const onCanPlay = () => {
+                isSwitching = false;
                 audio.currentTime = 0;
                 if (oldUrl) setTimeout(() => URL.revokeObjectURL(oldUrl), 0);
                 audio.removeEventListener("canplay", onCanPlay);
@@ -517,9 +525,10 @@
                 statusEl.textContent = "Ready.";
                 setTotalTime();
                 updateProgress();
-                if (wasPlaying) audio.play().catch(() => {});
+                if (fromEnded) audio.play().catch(() => {});
               };
               const onErr = () => {
+                isSwitching = false;
                 audio.removeEventListener("canplay", onCanPlay);
                 audio.removeEventListener("error", onErr);
                 if (oldUrl) {
