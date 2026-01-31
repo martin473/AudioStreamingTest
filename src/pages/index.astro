@@ -102,7 +102,7 @@
     <details class="debug" id="debugDetails" style="margin-top:1rem; font-size:0.75rem; color:#666;">
       <summary>Debug: chunk flow</summary>
       <pre id="debugLog" style="margin:0.25rem 0; white-space:pre-wrap; word-break:break-all;"></pre>
-      <p style="margin:0;"><strong>Flow:</strong> At <code>bufferEnd - 10s</code> we request next chunk. When it arrives we store it. At <code>bufferEnd - 0.5s</code> we switch to that chunk (single blob). If chunk arrives at boundary we switch immediately (sync). If we reach the end without a chunk, we show "Loading next chunk…" and re-request.</p>
+      <p style="margin:0;"><strong>Flow:</strong> At <code>bufferEnd - 10s</code> we request next chunk(s). <strong>Blob mode:</strong> two chunks (<code>count: 2</code>), stitch into 20s blob, switch at <code>bufferEnd - 0.5s</code>. <strong>MSE mode (Phase 3):</strong> one chunk (<code>count: 1</code>), append to SourceBuffer (no switch). If we reach the end without data, we show "Loading next chunk…" and re-request.</p>
     </details>
     <audio id="audio" preload="none"></audio>
 
@@ -135,10 +135,20 @@
         let pendingRequestKind = null; // "seek" | "next" | null; avoid applying stale seek response as append
         let seekSatisfiedFromCache = false; // true after applying seek from cache; next binary is stale seek response
         let loadId = 0; // single-flight: only latest setBufferFromChunks callbacks revoke/apply
-        let pendingNextChunk = null; // { buffer, range } when we have "next" chunk; switch at buffer end (no concat)
+        let pendingNextChunk = null; // when we have "next" chunk; switch at buffer end (no concat)
         let pendingNextRange = null;
+        let nextChunkCountExpected = 0; // 2 = waiting for two chunks to stitch (Phase 2)
+        let pendingNextPart1 = null; // first chunk when nextChunkCountExpected === 2
+        let pendingNextRangePart1 = null;
         let isSwitching = false; // true while we've set new src but not yet canplay (ignore stale ended)
         const CACHE_NAME = "audio-chunks";
+
+        const useMSE = typeof MediaSource !== "undefined" && MediaSource.isTypeSupported && MediaSource.isTypeSupported("audio/mpeg");
+        let mediaSource = null;
+        let sourceBuffer = null;
+        let mediaSourceUrl = null;
+        const mseAppendQueue = []; // { ab, range } when sourceBuffer.updating (Phase 3)
+        if (useMSE) console.info("Audio: using MSE (Phase 3) for seamless append");
 
         const debugLogEl = document.getElementById("debugLog");
         const debugEntries = [];
@@ -187,18 +197,57 @@
           return chunkRanges[chunkRanges.length - 1].end_s;
         }
 
+        function drainMseAppendQueue() {
+          if (!sourceBuffer || sourceBuffer.updating || mseAppendQueue.length === 0) return;
+          const { ab, range } = mseAppendQueue.shift();
+          sourceBuffer.appendBuffer(ab);
+          chunkRanges.push(range);
+          setTotalTime();
+          updateProgress();
+          caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+        }
+
+        function initMSE(ab, range) {
+          mediaSource = new MediaSource();
+          mediaSourceUrl = URL.createObjectURL(mediaSource);
+          audio.src = mediaSourceUrl;
+          mediaSource.addEventListener("sourceopen", () => {
+            sourceBuffer = mediaSource.addSourceBuffer("audio/mpeg");
+            sourceBuffer.addEventListener("updateend", drainMseAppendQueue);
+            chunkRanges.length = 0;
+            chunkRanges.push(range);
+            bufferStartTime = range.start_s;
+            sourceBuffer.appendBuffer(ab);
+            statusEl.textContent = "Ready. Press Play.";
+            playPauseBtn.disabled = false;
+            setTotalTime();
+            updateProgress();
+            debugLog("MSE: first chunk appended");
+          }, { once: true });
+          caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+        }
+
+        function appendToMSE(ab, range) {
+          if (!sourceBuffer) return;
+          if (sourceBuffer.updating) {
+            mseAppendQueue.push({ ab, range });
+            return;
+          }
+          sourceBuffer.appendBuffer(ab);
+          chunkRanges.push(range);
+          setTotalTime();
+          updateProgress();
+          debugLog(`MSE: appended range ${range.start_s}-${range.end_s}s`);
+          caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+        }
+
         function setBufferFromChunks(ranges, buffers, startTime, seekToTime) {
           loadId += 1;
           const myLoadId = loadId;
-          chunkBuffers.length = 0;
-          chunkBuffers.push(...buffers);
-          chunkRanges.length = 0;
-          chunkRanges.push(...ranges);
-          bufferStartTime = startTime;
-          const totalLen = chunkBuffers.reduce((s, b) => s + b.byteLength, 0);
+          const totalLen = buffers.reduce((s, b) => s + b.byteLength, 0);
           const out = new Uint8Array(totalLen);
           let offset = 0;
-          for (const b of chunkBuffers) {
+          for (const b of buffers) {
             out.set(new Uint8Array(b), offset);
             offset += b.byteLength;
           }
@@ -209,6 +258,11 @@
           audio.load();
           const afterLoad = () => {
             if (myLoadId !== loadId) return;
+            chunkBuffers.length = 0;
+            chunkBuffers.push(...buffers);
+            chunkRanges.length = 0;
+            chunkRanges.push(...ranges);
+            bufferStartTime = startTime;
             if (Number.isFinite(seekToTime) && seekToTime >= bufferStartTime && seekToTime <= getBufferEndSec()) {
               const seekOffset = Math.min(seekToTime - bufferStartTime, getBufferEndSec() - bufferStartTime);
               audio.currentTime = seekOffset;
@@ -295,18 +349,13 @@
             if (pendingSeekTime != null) {
               const seekTo = pendingSeekTime;
               if (seekTo >= range.start_s && seekTo < range.end_s) {
-                chunkBuffers.length = 0;
-                chunkRanges.length = 0;
-                chunkBuffers.push(ab);
-                chunkRanges.push(range);
-                bufferStartTime = range.start_s;
                 pendingSeekTime = null;
                 pendingSeekRange = null;
                 pendingRequestKind = null;
                 nextRequested = false;
                 pendingNextChunk = null;
                 pendingNextRange = null;
-                setBufferFromChunks(chunkRanges, chunkBuffers, bufferStartTime, seekTo);
+                setBufferFromChunks([range], [ab], range.start_s, seekTo);
                 caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
               } else {
                 caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
@@ -322,6 +371,13 @@
               return;
             }
             if (chunkBuffers.length === 0) {
+              if (useMSE) {
+                pendingRequestKind = null;
+                nextRequested = false;
+                initMSE(ab, range);
+                processNextPair();
+                return;
+              }
               chunkRanges.push(range);
               chunkBuffers.push(ab);
               pendingRequestKind = null;
@@ -341,8 +397,80 @@
               return;
             }
             if (pendingRequestKind === "next") {
-              pendingRequestKind = null;
+              if (useMSE) {
+                const bufferEnd = getBufferEndSec();
+                if (range.start_s !== bufferEnd) {
+                  debugLog(`MSE next mismatch: got ${range.start_s}-${range.end_s}s, need at ${bufferEnd}s`);
+                  caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+                  nextRequested = false;
+                  pendingRequestKind = null;
+                  processNextPair();
+                  return;
+                }
+                pendingRequestKind = null;
+                nextRequested = false;
+                appendToMSE(ab, range);
+                processNextPair();
+                return;
+              }
               const bufferEnd = getBufferEndSec();
+              if (nextChunkCountExpected === 2 && pendingNextPart1) {
+                if (range.start_s !== pendingNextRangePart1.end_s) {
+                  debugLog(`next part2 mismatch: got ${range.start_s}-${range.end_s}s, need after ${pendingNextRangePart1.end_s}s; discarding`);
+                  pendingNextPart1 = null;
+                  pendingNextRangePart1 = null;
+                  nextChunkCountExpected = 0;
+                  pendingRequestKind = null;
+                  nextRequested = false;
+                  caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+                  processNextPair();
+                  return;
+                }
+                const part1Start = pendingNextRangePart1.start_s;
+                const part1End = pendingNextRangePart1.end_s;
+                const part1Buf = pendingNextPart1;
+                const stitched = new Uint8Array(part1Buf.byteLength + ab.byteLength);
+                stitched.set(new Uint8Array(part1Buf), 0);
+                stitched.set(new Uint8Array(ab), part1Buf.byteLength);
+                pendingNextChunk = stitched.buffer;
+                pendingNextRange = { start_s: part1Start, end_s: range.end_s };
+                pendingNextPart1 = null;
+                pendingNextRangePart1 = null;
+                nextChunkCountExpected = 0;
+                pendingRequestKind = null;
+                nextRequested = false;
+                debugLog(`next received (stitched): range ${pendingNextRange.start_s}-${pendingNextRange.end_s}s`);
+                caches.open(CACHE_NAME).then((c) => {
+                  c.put(cacheKey(part1Start, part1End), new Response(part1Buf));
+                  c.put(cacheKey(range.start_s, range.end_s), new Response(ab));
+                }).catch(() => {});
+                setTotalTime();
+                updateProgress();
+                if (shouldSwitchAtBoundary(getSongCurrentTime(), getBufferEndSec(), 0.5)) {
+                  debugLog("already at boundary, switching immediately (sync)");
+                  switchToPendingNextChunk();
+                }
+                processNextPair();
+                return;
+              }
+              if (nextChunkCountExpected === 2 && !pendingNextPart1) {
+                if (range.start_s !== bufferEnd) {
+                  debugLog(`next part1 mismatch: got ${range.start_s}-${range.end_s}s, need chunk at ${bufferEnd}s; discarding`);
+                  caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+                  nextRequested = false;
+                  nextChunkCountExpected = 0;
+                  pendingRequestKind = null;
+                  processNextPair();
+                  return;
+                }
+                pendingNextPart1 = ab;
+                pendingNextRangePart1 = range;
+                debugLog(`next part1 received: range ${range.start_s}-${range.end_s}s, waiting for part2`);
+                caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
+                processNextPair();
+                return;
+              }
+              pendingRequestKind = null;
               if (range.start_s !== bufferEnd) {
                 debugLog(`next chunk mismatch: got ${range.start_s}-${range.end_s}s, need chunk starting at ${bufferEnd}s; discarding and will re-request`);
                 caches.open(CACHE_NAME).then((c) => c.put(cacheKey(range.start_s, range.end_s), new Response(ab)));
@@ -410,6 +538,7 @@
           blobUrl = URL.createObjectURL(new Blob([ab], { type: "audio/mpeg" }));
           audio.src = blobUrl;
           audio.load();
+          if (wasPlaying || forceResume) audio.play().catch(() => {}); // start decode sooner (Phase 2 pause fix)
           const afterSwitch = () => {
             isSwitching = false;
             audio.currentTime = 0;
@@ -459,11 +588,13 @@
             switchToPendingNextChunk();
             return;
           }
-          if (shouldRequestNext(songTime, bufferEnd, totalDuration, BUFFER_AHEAD_SEC) && !nextRequested && !pendingNextChunk) {
+          if (shouldRequestNext(songTime, bufferEnd, totalDuration, BUFFER_AHEAD_SEC) && !nextRequested && !pendingNextChunk && !pendingNextPart1) {
             nextRequested = true;
             pendingRequestKind = "next";
-            debugLog(`next requested at songTime=${songTime.toFixed(1)}s (bufferEnd=${bufferEnd}, 5s ahead)`);
-            ws.send(JSON.stringify({ next: true, bufferEnd }));
+            const nextCount = useMSE ? 1 : 2;
+            nextChunkCountExpected = nextCount;
+            debugLog(`next requested at songTime=${songTime.toFixed(1)}s (bufferEnd=${bufferEnd}, ${nextCount} chunk(s))`);
+            ws.send(JSON.stringify({ next: true, bufferEnd, count: nextCount }));
           }
           if (bufferEnd < totalDuration && shouldSwitchAtBoundary(songTime, bufferEnd, 0.5) && !pendingNextChunk && nextRequested) {
             debugLog(`at boundary ${songTime.toFixed(1)}s but next chunk not loaded yet`);
@@ -478,6 +609,13 @@
           if (isSwitching) return;
           const bufferEnd = getBufferEndSec();
           if (totalDuration <= 0 || bufferEnd >= totalDuration) return;
+          if (useMSE) {
+            nextRequested = false;
+            nextChunkCountExpected = 1;
+            statusEl.textContent = "Loading next chunk…";
+            ws.send(JSON.stringify({ next: true, bufferEnd, count: 1 }));
+            return;
+          }
           if (pendingNextChunk && pendingNextRange) {
             debugLog("ended with next chunk already loaded; switching");
             switchToPendingNextChunk({ forceResume: true });
@@ -488,7 +626,7 @@
             nextRequested = false;
             pendingRequestKind = "next";
             statusEl.textContent = "Loading next chunk…";
-            ws.send(JSON.stringify({ next: true, bufferEnd }));
+            nextChunkCountExpected = 2; ws.send(JSON.stringify({ next: true, bufferEnd, count: 2 }));
             return;
           }
           const key = cacheKey(nextRange.start_s, nextRange.end_s);
@@ -498,7 +636,7 @@
               nextRequested = false;
               pendingRequestKind = "next";
               statusEl.textContent = "Loading next chunk…";
-              ws.send(JSON.stringify({ next: true, bufferEnd }));
+              nextChunkCountExpected = 2; ws.send(JSON.stringify({ next: true, bufferEnd, count: 2 }));
               return;
             }
             cachedResp.arrayBuffer().then((ab) => {
@@ -539,7 +677,7 @@
                 nextRequested = false;
                 pendingRequestKind = "next";
                 statusEl.textContent = "Loading next chunk…";
-                ws.send(JSON.stringify({ next: true, bufferEnd }));
+                nextChunkCountExpected = 2; ws.send(JSON.stringify({ next: true, bufferEnd, count: 2 }));
               };
               audio.addEventListener("canplay", onCanPlay);
               audio.addEventListener("error", onErr);
@@ -549,7 +687,7 @@
             nextRequested = false;
             pendingRequestKind = "next";
             statusEl.textContent = "Loading next chunk…";
-            ws.send(JSON.stringify({ next: true, bufferEnd }));
+            nextChunkCountExpected = 2; ws.send(JSON.stringify({ next: true, bufferEnd, count: 2 }));
           });
         });
 
@@ -577,11 +715,6 @@
             if (cachedResp) {
               return cachedResp.arrayBuffer().then((ab) => {
                 if (pendingSeekTime !== targetTime) return;
-                chunkBuffers.length = 0;
-                chunkRanges.length = 0;
-                chunkBuffers.push(ab);
-                chunkRanges.push(range);
-                bufferStartTime = range.start_s;
                 nextRequested = false;
                 pendingSeekTime = null;
                 pendingSeekRange = null;
@@ -589,7 +722,7 @@
                 seekSatisfiedFromCache = true;
                 pendingNextChunk = null;
                 pendingNextRange = null;
-                setBufferFromChunks(chunkRanges, chunkBuffers, bufferStartTime, targetTime);
+                setBufferFromChunks([range], [ab], range.start_s, targetTime);
               });
               return;
             }

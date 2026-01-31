@@ -48,9 +48,9 @@ Use **MSE** so the browser handles seamless playback:
 
 ## Order of implementation
 
-1. **Phase 1 — Force resume:** Implement Option A (and/or B), verify that when we switch from the `ended` handler we always call `audio.play()`. No change to chunk loading or stitching.
-2. **Phase 2 — Stitch (optional):** Only if we want fewer switches or still see glitches; implement rolling two-chunk blobs (30s+10s, then 10s+10s, etc.) as above.
-3. **Phase 3 — MSE (optional):** If we need seamless playback across many chunks without any `src` changes, add MSE and consider fMP4 (or MSE-compatible) segments.
+1. **Phase 1 — Force resume:** ✅ Implemented. Option A (forceResume from ended) + isSwitching guard.
+2. **Phase 2 — Stitch:** ✅ Implemented. Client requests `count: 2`, server sends two chunks; client stitches into one 20s blob and switches at boundary (fewer switches).
+3. **Phase 3 — MSE:** ✅ Implemented. When `MediaSource.isTypeSupported('audio/mpeg')` we use MediaSource + SourceBuffer; append chunks (count: 1) for seamless playback without switching. Fallback: blob mode (Phase 2).
 
 ---
 

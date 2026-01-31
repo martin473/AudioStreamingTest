@@ -124,11 +124,32 @@ async function createServer() {
       if (typeof payload.t === "number") {
         entry = getChunk(chunkIndex, payload.t);
       } else if (payload.next === true) {
+        const count = Math.max(1, Math.min(2, parseInt(payload.count, 10) || 1));
         if (typeof payload.bufferEnd === "number") {
           entry = getChunkStartingAt(chunkIndex, payload.bufferEnd);
         }
         if (!entry) {
           entry = getChunkByIndex(chunkIndex, lastSentChunkIndex + 1);
+        }
+        if (entry && count === 2) {
+          const second = getChunkByIndex(chunkIndex, entry.id + 1);
+          const entries = second ? [entry, second] : [entry];
+          for (const e of entries) {
+            try {
+              ws.send(JSON.stringify({ start_s: e.start_s, end_s: e.end_s }), { binary: false });
+              ws.send(readChunkFile(e), { binary: true });
+              lastSentChunkIndex = e.id;
+            } catch (err) {
+              console.error("Failed to send chunk:", err.message);
+              try {
+                ws.send(JSON.stringify({ error: "chunk_unavailable", start_s: e.start_s, end_s: e.end_s }), { binary: false });
+              } catch (sendErr) {
+                console.error("Failed to send chunk_unavailable:", sendErr.message);
+              }
+              break;
+            }
+          }
+          return;
         }
       }
       if (entry) {
